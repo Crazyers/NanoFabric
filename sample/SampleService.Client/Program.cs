@@ -1,37 +1,56 @@
-﻿using NanoFabric.RegistryHost.ConsulRegistry;
-using NanoFabric.Router;
+﻿using Consul;
+using DnsClient;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
+using NanoFabric.Router;
+using NanoFabric.Router.Consul;
 using System;
+using System.IO;
+using System.Net.Http;
 
 class Program
 {
+    private readonly IDnsQuery _dns;
+    private static ServiceProvider _serviceProvider;
+
     static void Main(string[] args)
     {
-        ServiceCollection services = new ServiceCollection(); // 准备好我们的容器
-        var registryClient = BuildRegistryClient("urlprefix-");
-        var uri = new Uri("http://10.125.32.121:9030/values");
-        var results = registryClient.FindServiceInstancesAsync(uri).Result;
-        if (results != null)
+        Initialize();
+        IServiceSubscriberFactory subscriberFactory = _serviceProvider.GetRequiredService<IServiceSubscriberFactory>();
+        // 创建ConsoleLogProvider并根据日志类目名称（CategoryName）生成Logger实例
+        var logger = _serviceProvider.GetService<ILoggerFactory>().AddConsole().CreateLogger("App");
+
+        var serviceSubscriber = subscriberFactory.CreateSubscriber("SampleService.Kestrel",ConsulSubscriberOptions.Default, new NanoFabric.Router.Throttle.ThrottleSubscriberOptions() {  MaxUpdatesPeriod = TimeSpan.FromSeconds(30), MaxUpdatesPerPeriod = 20} );
+        serviceSubscriber.StartSubscription().ConfigureAwait(false).GetAwaiter().GetResult();
+        serviceSubscriber.EndpointsChanged += async (sender, eventArgs) =>
         {
-            var registerHost = registryClient.Choose(results);
-
-            Console.WriteLine($"{registerHost.Address }:{registerHost.Port}");
-        }
-        Console.ReadLine();
+            // Reset connection pool, do something with this info, etc
+            var endpoints = await serviceSubscriber.Endpoints();
+            var servicesInfo = string.Join(",", endpoints);
+            logger.LogInformation($"Received updated subscribers [{servicesInfo}]");
+        };
+        ILoadBalancer loadBalancer = new RoundRobinLoadBalancer(serviceSubscriber);
+        var endPoint = loadBalancer.Endpoint().ConfigureAwait(false).GetAwaiter().GetResult();
+                var httpClient = new HttpClient();
+        var traceid = Guid.NewGuid().ToString();
+        httpClient.DefaultRequestHeaders.Add("ot-traceid", traceid);
+        var content = httpClient.GetStringAsync($"{endPoint.ToUri()}api/values").Result;
+        Console.WriteLine($"{traceid} content: {content }");
+        System.Console.ReadLine();
     }
 
-    private  static RegistryClient BuildRegistryClient(string prefixName)
+    private static void Initialize()
     {
-        var configuration = new ConsulRegistryHostConfiguration() { HostName = "localhost" };
+        var configuration = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
+            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+            .Build();
 
-        var consul = new ConsulRegistryHost(configuration);
-
-        var registryClient = new RegistryClient(prefixName, new RoundRobinAddressRouter());
-        registryClient.AddRegistryHost(consul);
-
-        return registryClient;
+        _serviceProvider = new ServiceCollection()
+            .AddNanoFabricConsulRouter(configuration)
+            .AddLogging()
+            .BuildServiceProvider();
     }
-
-
-
 }
